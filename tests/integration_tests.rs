@@ -623,13 +623,14 @@ async fn check_pay_offer_with_reconnection(
 
     // Setup a task to kill LND after the pay_offer has already started.
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(210)).await;
+        tokio::time::sleep(Duration::from_millis(270)).await;
         let mut lnd = lnd_clone.lock().await;
         lnd.kill_lnd().await;
     });
 
     // Start a pay_offer process.
     let res1 = handler.pay_offer(pay_cfg.clone()).await;
+    println!("====res1 answer {:?}", res1);
     let mut lnd = lnd_arc.lock().await;
 
     // Restart LND node with the same previous arguments.
@@ -649,6 +650,7 @@ async fn check_pay_offer_with_reconnection(
     // again to the restart LND node, fetched the peers, and be able to handle
     // a second pay_offer
     let res2 = handler.pay_offer(pay_cfg.clone()).await;
+    println!("====res2 answer {:?}", res2);
 
     // We check that the first pay_offer fails because the LND has been kill.
     assert!(res1.is_err());
