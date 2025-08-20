@@ -501,7 +501,8 @@ impl LndNode {
                             .lightning()
                             .get_info(get_info_req.clone())
                             .await {
-                                Ok(_) => {
+                                Ok(a) => {
+                                    println!("info is {:?}", a);
                                     return Ok(())
                                 },
                                 Err(_) => {
