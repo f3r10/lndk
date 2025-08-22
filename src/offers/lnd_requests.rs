@@ -266,10 +266,13 @@ pub(crate) async fn connect_to_peer(
         .await
         .map_err(OfferError::PeerConnectError)?;
 
+    println!("=========going to connect with the peer");
     let node = match node.node {
         Some(node) => node,
         None => return Err(OfferError::NodeAddressNotFound),
     };
+
+    println!("======after checking node {:?}", node);
 
     if node.addresses.is_empty() {
         return Err(OfferError::NodeAddressNotFound);
