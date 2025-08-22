@@ -490,34 +490,21 @@ impl LndNode {
     pub async fn check_lnd_running(
         &mut self,
         mut interval: Interval,
-        node_id: PublicKey,
     ) -> Result<(), Box<dyn Error>> {
         if let Some(client) = self.client.clone() {
-            let node_info_req = tonic_lnd::lnrpc::NodeInfoRequest {
-                pub_key: node_id.to_string(),
-                include_channels: false,
-            };
+            let get_info_req = GetInfoRequest {};
             loop {
                 select!(
                     _ = interval.tick() => {
                         match client
                             .clone()
                             .lightning()
-                            .get_node_info(node_info_req.clone())
+                            .get_info(get_info_req.clone())
                             .await {
-                                Ok(node_info) => {
-                                    if let Some(node) = node_info.into_inner().node {
-                                        if !node.addresses.is_empty() {
-                                            return Ok(());
-                                        } else {
-                                            log::trace!("Node {} found but has no addresses yet", node_id);
-                                        }
-                                    } else {
-                                        log::trace!("Node {} found in response but node field is None", node_id);
-                                    }
+                                Ok(_) => {
+                                    return Ok(())
                                 },
                                 Err(_) => {
-                                    log::trace!("Node info not found yet for {}", node_id);
                                     continue
                                 }
                             }
