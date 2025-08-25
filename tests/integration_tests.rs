@@ -641,7 +641,7 @@ async fn check_pay_offer_with_reconnection(
     // Wait until LND is available again
     lnd.check_lnd_running(interval).await.unwrap();
 
-    // Wait until node address is sync again
+    // Wait until lnd graph some addresses for node_id.
     lnd.wait_for_addresses_to_sync(node_id).await;
 
     // Send another pay_offer process using the same handler.
