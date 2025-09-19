@@ -718,6 +718,7 @@ pub async fn test_payment_with_first_route_down(
         .await
         .map_err(|e| format!("Failed to get invoice: {:?}", e))?;
 
+    println!("invoice {:?}", invoice.payment_paths());
     assert!(invoice.payment_paths().len() == 2);
 
     let first_path = invoice
