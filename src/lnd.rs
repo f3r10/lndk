@@ -7,12 +7,16 @@ use bitcoin::secp256k1::ecdsa::{RecoverableSignature, Signature};
 use bitcoin::secp256k1::{self, PublicKey, Scalar, Secp256k1};
 use bitcoin::Network;
 use futures::executor::block_on;
+use lightning::blinded_path::payment::BlindedPayInfo;
 use lightning::blinded_path::payment::BlindedPaymentPath;
+use lightning::blinded_path::BlindedHop;
 use lightning::bolt11_invoice::RawBolt11Invoice;
 use lightning::ln::inbound_payment::ExpandedKey;
 use lightning::ln::msgs::UnsignedGossipMessage;
 use lightning::offers::invoice::UnsignedBolt12Invoice;
+use lightning::offers::invoice_request::InvoiceRequest;
 use lightning::sign::{NodeSigner, Recipient};
+use lightning::types::features::BlindedHopFeatures;
 use log::error;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -20,14 +24,18 @@ use std::error::Error;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::{fmt, fs};
+use tonic::{Code, Status};
+use tonic_lnd::lnrpc::AddInvoiceResponse;
+use tonic_lnd::lnrpc::PayReq;
 use tonic_lnd::lnrpc::{
-    FeeLimit, GetInfoResponse, HtlcAttempt, ListPeersResponse, NodeInfo, Payment,
-    QueryRoutesResponse, Route,
+    FeeLimit, GetInfoResponse, HtlcAttempt, ListChannelsResponse, ListPeersResponse, NodeInfo,
+    Payment, QueryRoutesResponse, Route,
 };
 use tonic_lnd::signrpc::KeyLocator;
-use tonic_lnd::tonic::Status;
+use tonic_lnd::tonic::Status as LndStatus;
 use tonic_lnd::verrpc::Version;
-use tonic_lnd::{Client, ConnectError};
+use tonic_lnd::{Client, Error as ConnectError};
+use tonic_types::{ErrorDetails, StatusExt};
 
 const ONION_MESSAGES_REQUIRED: u32 = 38;
 pub(crate) const ONION_MESSAGES_OPTIONAL: u32 = 39;
@@ -46,11 +54,13 @@ const SEED_KEY_INDEX: i32 = 425;
 
 /// get_lnd_client connects to LND's grpc api using the config provided, blocking until a connection
 /// is established.
-pub fn get_lnd_client(cfg: LndCfg) -> Result<Client, ConnectError> {
+pub fn get_lnd_client(cfg: LndCfg) -> Result<Client, LndError> {
     match cfg.creds {
-        Creds::Path { macaroon, cert } => block_on(tonic_lnd::connect(cfg.address, cert, macaroon)),
+        Creds::Path { macaroon, cert } => block_on(tonic_lnd::connect(cfg.address, cert, macaroon))
+            .map_err(LndError::ConnectError),
         Creds::String { macaroon, cert } => {
             block_on(tonic_lnd::connect_from_memory(cfg.address, cert, macaroon))
+                .map_err(LndError::ConnectError)
         }
     }
 }
@@ -353,8 +363,75 @@ impl fmt::Display for NetworkParseError {
     }
 }
 
+#[derive(Debug)]
+/// LndError represents errors that occur when interacting with LND.
+pub enum LndError {
+    /// Failed to connect to LND node.
+    ConnectError(ConnectError),
+    /// Failed to parse network configuration.
+    NetworkParseError(NetworkParseError),
+    /// LND node is not connected to bitcoin network.
+    NetworkNotConnected,
+    /// LND service is unavailable or not responding.
+    ServiceUnavailable(LndStatus),
+}
+
+impl LndError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            LndError::ConnectError(_) => "CONNECT_ERROR",
+            LndError::NetworkParseError(_) => "NETWORK_PARSE_ERROR",
+            LndError::NetworkNotConnected => "NETWORK_NOT_CONNECTED",
+            LndError::ServiceUnavailable(_) => "SERVICE_UNAVAILABLE",
+        }
+    }
+
+    pub fn grpc_code(&self) -> Code {
+        match self {
+            LndError::NetworkParseError(_) => Code::InvalidArgument,
+            LndError::ConnectError(_)
+            | LndError::NetworkNotConnected
+            | LndError::ServiceUnavailable(_) => Code::Unavailable,
+        }
+    }
+
+    pub fn to_status(self) -> Status {
+        let error_code = self.code();
+        let grpc_code = self.grpc_code();
+        let human_message = self.to_string();
+
+        let details =
+            ErrorDetails::with_error_info(error_code, "lndk", std::collections::HashMap::new());
+
+        Status::with_error_details(grpc_code, human_message, details)
+    }
+}
+
+impl Display for LndError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LndError::ConnectError(e) => write!(f, "Failed to connect to LND: {e}"),
+            LndError::NetworkParseError(e) => {
+                write!(f, "Failed to parse network configuration: {e}")
+            }
+            LndError::NetworkNotConnected => {
+                write!(f, "LND node is not connected to bitcoin network")
+            }
+            LndError::ServiceUnavailable(e) => write!(f, "LND service is unavailable: {e}"),
+        }
+    }
+}
+
+impl Error for LndError {}
+
+impl From<LndError> for Status {
+    fn from(error: LndError) -> Self {
+        error.to_status()
+    }
+}
+
 // get_network grabs what network lnd is running on from the LND API.
-pub async fn get_network(info: GetInfoResponse) -> Result<Network, ()> {
+pub async fn get_network(info: GetInfoResponse) -> Result<Network, LndError> {
     let mut network_str = None;
     #[allow(deprecated)]
     for chain in info.chains {
@@ -362,11 +439,12 @@ pub async fn get_network(info: GetInfoResponse) -> Result<Network, ()> {
             network_str = Some(chain.network.clone())
         }
     }
-    if network_str.is_none() {
+    let network_str = network_str.ok_or_else(|| {
         error!("lnd node is not connected to bitcoin network as expected");
-        return Err(());
-    }
-    Ok(string_to_network(&network_str.unwrap()).unwrap())
+        LndError::NetworkNotConnected
+    })?;
+
+    string_to_network(&network_str).map_err(LndError::NetworkParseError)
 }
 
 pub fn string_to_network(network_str: &str) -> Result<Network, NetworkParseError> {
@@ -403,6 +481,53 @@ pub async fn build_seed_from_lnd_node(signer: &mut impl MessageSigner) -> Result
     let seed = hash.to_byte_array();
     Ok(seed)
 }
+pub fn parse_blinded_paths(
+    blinded_paths: Vec<tonic_lnd::lnrpc::BlindedPaymentPath>,
+) -> Vec<BlindedPaymentPath> {
+    blinded_paths
+        .iter()
+        .map(|blinded_path| {
+            let features_le_bytes = feature_bits_to_le_bytes(&blinded_path.features);
+            let features = BlindedHopFeatures::from_le_bytes(features_le_bytes);
+            let blinded_pay_info = BlindedPayInfo {
+                fee_base_msat: blinded_path.base_fee_msat as u32,
+                fee_proportional_millionths: blinded_path.proportional_fee_rate,
+                cltv_expiry_delta: blinded_path.total_cltv_delta as u16,
+                htlc_minimum_msat: blinded_path.htlc_min_msat,
+                htlc_maximum_msat: blinded_path.htlc_max_msat,
+                features,
+            };
+
+            let lnd_blinded_path = blinded_path.blinded_path.as_ref().unwrap();
+            let node_id = PublicKey::from_slice(&lnd_blinded_path.introduction_node)
+                .expect("Failed to parse introduction node public key");
+            let blinding_point = PublicKey::from_slice(&lnd_blinded_path.blinding_point)
+                .expect("Failed to parse blinding point");
+
+            BlindedPaymentPath::from_blinded_path_and_payinfo(
+                node_id,
+                blinding_point,
+                parse_blinded_hops(&lnd_blinded_path.blinded_hops.clone()),
+                blinded_pay_info,
+            )
+        })
+        .collect()
+}
+
+fn parse_blinded_hops(blinded_hops: &[tonic_lnd::lnrpc::BlindedHop]) -> Vec<BlindedHop> {
+    blinded_hops
+        .iter()
+        .map(|hop| {
+            let blinded_node_id =
+                PublicKey::from_slice(&hop.blinded_node).expect("Failed to parse blinding point");
+            let encrypted_payload = hop.encrypted_data.clone();
+            BlindedHop {
+                blinded_node_id,
+                encrypted_payload,
+            }
+        })
+        .collect()
+}
 
 /// Converts vector of bits numbers as i32 (0 - 128) to little endian bytes
 fn feature_bits_to_le_bytes(feature_bits: &[i32]) -> Vec<u8> {
@@ -430,13 +555,14 @@ pub trait MessageSigner {
 /// PeerConnector provides a layer of abstraction over the LND API for connecting to a peer.
 #[async_trait]
 pub trait PeerConnector {
-    async fn list_peers(&mut self) -> Result<ListPeersResponse, Status>;
-    async fn connect_peer(&mut self, node_id: String, addr: String) -> Result<(), Status>;
+    async fn list_peers(&mut self) -> Result<ListPeersResponse, LndStatus>;
+    async fn connect_peer(&mut self, node_id: String, addr: String) -> Result<(), LndStatus>;
     async fn get_node_info(
         &mut self,
         pub_key: String,
         include_channels: bool,
-    ) -> Result<NodeInfo, Status>;
+    ) -> Result<NodeInfo, LndStatus>;
+    async fn list_active_public_channels(&mut self) -> Result<ListChannelsResponse, LndStatus>;
 }
 
 /// InvoicePayer provides a layer of abstraction over the LND API for paying for a BOLT 12 invoice.
@@ -450,13 +576,31 @@ pub trait InvoicePayer {
         fee_ppm: u32,
         msats: u64,
         fee_limit: Option<FeeLimit>,
-    ) -> Result<QueryRoutesResponse, Status>;
+    ) -> Result<QueryRoutesResponse, LndStatus>;
     async fn send_to_route(
         &mut self,
         payment_hash: [u8; 32],
         route: Route,
-    ) -> Result<HtlcAttempt, Status>;
+    ) -> Result<HtlcAttempt, LndStatus>;
     async fn track_payment(&mut self, payment_hash: [u8; 32]) -> Result<Payment, OfferError>;
+}
+
+#[async_trait]
+pub trait OfferCreator {
+    async fn get_info(&mut self) -> Result<GetInfoResponse, LndStatus>;
+}
+
+#[async_trait]
+pub trait Bolt12InvoiceCreator {
+    async fn add_invoice(
+        &mut self,
+        invoice_request: InvoiceRequest,
+    ) -> Result<AddInvoiceResponse, LndStatus>;
+
+    async fn decode_payment_request(
+        &mut self,
+        payment_request: String,
+    ) -> Result<PayReq, LndStatus>;
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use chrono::Utc;
 use corepc_node::{get_available_port, Conf, ConnectParams, Node};
 use ldk_sample::config::LdkUserInfo;
 use ldk_sample::node_api::Node as LdkNode;
+use ldk_sample::HTLCStatus;
 use lightning::util::logger::Level;
 use lndk::lnd::validate_lnd_creds;
 use lndk::offers::handler::OfferHandler;
@@ -25,14 +26,14 @@ use tempfile::{tempdir, Builder, TempDir};
 use tokio::select;
 use tokio::time::Interval;
 use tokio::time::{sleep, timeout, Duration};
-use tonic_lnd::lnrpc::{AddressType, GetInfoRequest};
+use tonic_lnd::lnrpc::{AddressType, GetInfoRequest, InvoiceHtlcState, ListInvoiceRequest};
 use tonic_lnd::Client;
 
 const LNDK_TESTS_FOLDER: &str = "lndk-tests";
 
 pub async fn setup_test_infrastructure(
     test_name: &str,
-) -> (BitcoindNode, LndNode, LdkNode, LdkNode, PathBuf) {
+) -> (BitcoindNode, LndNode, LdkNode, LdkNode, PathBuf, PathBuf) {
     let bitcoind = setup_bitcoind().await;
     let (ldk_test_dir, lnd_test_dir, lndk_test_dir) = setup_test_dirs(test_name);
     let mut lnd = LndNode::new(
@@ -43,13 +44,24 @@ pub async fn setup_test_infrastructure(
     );
     lnd.setup_client().await;
 
-    let connect_params = bitcoind.node.params.get_cookie_values().unwrap();
+    let ldk1 = setup_ldk_node(&bitcoind, 1, &ldk_test_dir, test_name).await;
+    let ldk2 = setup_ldk_node(&bitcoind, 2, &ldk_test_dir, test_name).await;
 
+    (bitcoind, lnd, ldk1, ldk2, lndk_test_dir, ldk_test_dir)
+}
+
+pub async fn setup_ldk_node(
+    bitcoind: &BitcoindNode,
+    node_num: u8,
+    ldk_test_dir: &PathBuf,
+    test_name: &str,
+) -> LdkNode {
+    let connect_params = bitcoind.node.params.get_cookie_values().unwrap();
     let port = get_available_port().unwrap();
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
     let cookie_values = connect_params.unwrap();
 
-    let ldk1_config = LdkUserInfo {
+    let ldk_config = LdkUserInfo {
         bitcoind_rpc_username: cookie_values.user.clone(),
         bitcoind_rpc_password: cookie_values.password.clone(),
         bitcoind_rpc_host: String::from("localhost"),
@@ -60,29 +72,10 @@ pub async fn setup_test_infrastructure(
         ldk_announced_node_name: [0; 32],
         network: Network::Regtest,
         log_level: Level::Trace,
-        node_num: 1,
+        node_num: node_num,
     };
 
-    let port = get_available_port().unwrap();
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-    let ldk2_config = LdkUserInfo {
-        bitcoind_rpc_username: cookie_values.user.clone(),
-        bitcoind_rpc_password: cookie_values.password.clone(),
-        bitcoind_rpc_host: String::from("localhost"),
-        bitcoind_rpc_port: bitcoind.node.params.rpc_socket.port(),
-        ldk_data_dir: ldk_test_dir,
-        ldk_announced_listen_addr: vec![addr.into()],
-        ldk_peer_listening_port: port,
-        ldk_announced_node_name: [0; 32],
-        network: Network::Regtest,
-        log_level: Level::Trace,
-        node_num: 2,
-    };
-
-    let ldk1 = ldk_sample::start_ldk(ldk1_config, test_name).await;
-    let ldk2 = ldk_sample::start_ldk(ldk2_config, test_name).await;
-
-    (bitcoind, lnd, ldk1, ldk2, lndk_test_dir)
+    ldk_sample::start_ldk(ldk_config, test_name).await
 }
 
 // connect_network establishes connections/channels between our nodes, and mines enough blocks and
@@ -90,7 +83,8 @@ pub async fn setup_test_infrastructure(
 pub async fn connect_network(
     ldk1: &LdkNode,
     ldk2: &LdkNode,
-    announce_channel: bool,
+    announce_channel_ldk: bool,
+    announce_channel_lnd: bool,
     lnd: &mut LndNode,
     bitcoind: &BitcoindNode,
 ) -> (PublicKey, PublicKey, PublicKey) {
@@ -134,18 +128,24 @@ pub async fn connect_network(
 
     lnd.wait_for_chain_sync().await;
 
-    ldk2.open_channel(ldk1_pubkey, addr, 200000, 0, false)
-        .await
-        .unwrap();
+    ldk2.open_channel(
+        ldk1_pubkey,
+        addr,
+        300_000,
+        100_000_000,
+        announce_channel_ldk,
+    )
+    .await
+    .unwrap();
 
     lnd.wait_for_graph_sync().await;
 
     ldk2.open_channel(
         lnd_pubkey,
         SocketAddr::from_str(&lnd_network_addr).unwrap(),
-        200000,
-        10000000,
-        announce_channel,
+        300_000,
+        100_000_000,
+        announce_channel_lnd,
     )
     .await
     .unwrap();
@@ -207,6 +207,40 @@ pub async fn setup_lndk(
     return (lndk_cfg, handler, messenger, shutdown);
 }
 
+pub async fn isolate_node(ldk_node: &LdkNode, bitcoind: &BitcoindNode) {
+    let channels_info = ldk_node.list_channels().await;
+    let address = bitcoind.node.client.new_address().unwrap();
+
+    log::info!("Closing channels...");
+
+    for channel in channels_info {
+        ldk_node.close_channel(channel.0, channel.1).await.unwrap();
+
+        // We need to generate a block so we avoid that transaction output is unspendable.
+        bitcoind
+            .node
+            .client
+            .generate_to_address(1, &address)
+            .unwrap();
+    }
+
+    log::info!("Waiting for list channels to be empty...");
+
+    match timeout(Duration::from_secs(100), async {
+        loop {
+            let channels_info = ldk_node.list_channels().await;
+            if channels_info.len() == 0 {
+                break;
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await
+    {
+        Err(_) => panic!("timeout before channel closed"),
+        _ => {}
+    };
+}
 // Sets up /tmp/lndk-tests folder where we'll store the bins, data directories, and logs needed
 // for our tests.
 //
@@ -307,6 +341,76 @@ pub fn get_lnd_args(
     (args.to_vec(), stdout_file, stderr_file)
 }
 
+pub async fn wait_for_ldk_payment_completion(
+    ldk_node: &LdkNode,
+    timeout_duration: Duration,
+) -> Result<(), ()> {
+    log::info!("Waiting for payment to complete...");
+    let start_time = tokio::time::Instant::now();
+
+    loop {
+        if start_time.elapsed() > timeout_duration {
+            return Err(());
+        }
+
+        let payments = ldk_node.list_payments().await;
+
+        if let Some(latest_payment) = payments.last() {
+            log::debug!("Checking payment status: {:?}", latest_payment.status);
+            match latest_payment.status {
+                HTLCStatus::Pending => {
+                    log::debug!("Payment still pending, waiting 1 second...");
+                    sleep(Duration::from_secs(1)).await;
+                }
+                HTLCStatus::Succeeded => {
+                    log::info!("Payment succeeded");
+                    return Ok(());
+                }
+                HTLCStatus::Failed => {
+                    log::error!("Payment failed");
+                    return Err(());
+                }
+            }
+        } else {
+            log::debug!("No payments found yet, waiting 1 second...");
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+}
+
+pub async fn wait_for_lnd_payment_completion(
+    lnd_client: &mut Client,
+    timeout_duration: Duration,
+) -> Result<(), ()> {
+    log::info!("Waiting for payment to appear in lnd...");
+    let start_time = tokio::time::Instant::now();
+
+    loop {
+        if start_time.elapsed() > timeout_duration {
+            return Err(());
+        }
+
+        let invoices = lnd_client
+            .lightning()
+            .list_invoices(ListInvoiceRequest {
+                ..Default::default()
+            })
+            .await;
+        assert!(invoices.is_ok());
+        let invoices = invoices.unwrap().into_inner();
+        if !invoices.invoices.is_empty() {
+            let invoice = invoices.invoices[0].clone();
+            log::debug!("Invoice status: {:?}", invoice.state);
+            if invoice.state == InvoiceHtlcState::Settled as i32 {
+                log::info!("Payment succeeded");
+                return Ok(());
+            }
+        }
+        log::debug!("No payments found yet, waiting 1 second...");
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
 // BitcoindNode holds the tools we need to interact with a Bitcoind node.
 pub struct BitcoindNode {
     pub node: Node,
@@ -393,7 +497,6 @@ impl LndNode {
         let lnd_port = corepc_node::get_available_port().unwrap();
         let rpc_addr = format!("localhost:{}", port);
         let cert_path = lnd_dir.to_str().unwrap().to_string() + "/tls.cert";
-
         let (args, stdout_file, stderr_file) = get_lnd_args(
             &lnd_dir_binding,
             &bitcoind_connect_params,
@@ -438,12 +541,12 @@ impl LndNode {
         while retry_num == 0 || retry {
             thread::sleep(Duration::from_secs(3));
 
-            let client_result = tonic_lnd::connect(
-                self.address.clone(),
-                self.cert_path.clone(),
-                self.macaroon_path.clone(),
-            )
-            .await;
+            let client_result = tonic_lnd::ClientBuilder::new()
+                .address(self.address.clone())
+                .cert_path(self.cert_path.clone())
+                .macaroon_path(self.macaroon_path.clone())
+                .build()
+                .await;
 
             match client_result {
                 Ok(client) => {
@@ -650,6 +753,7 @@ impl LndNode {
                 Ok(node_info) => {
                     if let Some(node) = node_info.node {
                         if !node.addresses.is_empty() {
+                            log::trace!("Node has address {:?}", node);
                             return;
                         } else {
                             log::trace!("Node {} found but has no addresses yet", node_id);
@@ -715,5 +819,65 @@ impl LndNode {
             .expect("Failed to execute lnd command");
 
         self.handle = cmd;
+    }
+
+    // wait_for_nodes_addresses waits until all LDK nodes have addresses in the LND node's graph.
+    // We'll timeout if it takes too long.
+    pub async fn wait_for_nodes_addresses(&mut self, ldk_nodes: &[&LdkNode]) {
+        match timeout(
+            Duration::from_secs(100),
+            self.check_nodes_addresses(ldk_nodes),
+        )
+        .await
+        {
+            Err(_) => panic!("timeout before all LDK nodes have addresses in graph"),
+            _ => {}
+        };
+    }
+
+    pub async fn check_nodes_addresses(&mut self, ldk_nodes: &[&LdkNode]) {
+        loop {
+            let mut all_have_addresses = true;
+
+            for ldk_node in ldk_nodes {
+                let (pubkey, _) = ldk_node.get_node_info();
+
+                let node_info_req = tonic_lnd::lnrpc::NodeInfoRequest {
+                    pub_key: pubkey.to_string(),
+                    include_channels: false,
+                };
+
+                let client = self.client.clone().unwrap();
+                let resp = client
+                    .clone()
+                    .lightning()
+                    .get_node_info(node_info_req.clone())
+                    .await;
+
+                match resp {
+                    Ok(response) => {
+                        if let Some(node) = response.into_inner().node {
+                            if node.addresses.is_empty() {
+                                all_have_addresses = false;
+                                break;
+                            }
+                        } else {
+                            all_have_addresses = false;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        all_have_addresses = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_have_addresses {
+                return;
+            }
+
+            sleep(Duration::from_secs(2)).await;
+        }
     }
 }

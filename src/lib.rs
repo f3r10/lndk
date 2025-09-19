@@ -2,6 +2,7 @@ mod clock;
 mod grpc;
 #[allow(dead_code)]
 pub mod lnd;
+mod message_router;
 pub mod offers;
 pub mod onion_messenger;
 mod rate_limit;
@@ -31,7 +32,9 @@ use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config as LogConfig, Logger, Root};
 use log4rs::encode::pattern::PatternEncoder;
+use message_router::MessageRouter;
 use offers::handler::OfferHandler;
+use offers::OfferError;
 use rate_limit::RateLimiterCfg;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -151,7 +154,9 @@ impl LndkOnionMessenger {
             .await
             .expect("failed to get info")
             .into_inner();
-        let network = get_network(info.clone()).await?;
+        let network = get_network(info.clone())
+            .await
+            .expect("failed to get network");
 
         let pubkey = PublicKey::from_str(&info.identity_pubkey).unwrap();
         info!("Starting lndk on {network} network for node: {pubkey}.");
@@ -190,7 +195,9 @@ impl LndkOnionMessenger {
         let node_signer = LndNodeSigner::new(pubkey, &mut node_client);
         let messenger_utils = MessengerUtilities::default();
         let network_graph = &NetworkGraph::new(network, &messenger_utils);
-        let message_router = &DefaultMessageRouter::new(network_graph, &messenger_utils);
+        let default_message_router = DefaultMessageRouter::new(network_graph, &messenger_utils);
+        let message_router =
+            &MessageRouter::new(default_message_router, client.clone().lightning_read_only());
         let node_id_lookup = LndkNodeIdLookUp::new(client.clone(), pubkey);
         let onion_messenger = OnionMessenger::new(
             &messenger_utils,
@@ -228,11 +235,13 @@ impl Default for LndkOnionMessenger {
 pub struct Bolt12InvoiceString(pub String);
 
 impl TryFrom<Bolt12InvoiceString> for Bolt12Invoice {
-    type Error = DecodeError;
+    type Error = OfferError;
 
     fn try_from(s: Bolt12InvoiceString) -> Result<Self, Self::Error> {
-        let bytes: Vec<u8> = hex::decode(s.0).unwrap();
-        Self::try_from(bytes).map_err(|_| DecodeError::InvalidValue)
+        let bytes: Vec<u8> = hex::decode(s.0)
+            .map_err(|_| OfferError::ParseInvoiceFailure(DecodeError::InvalidValue))?;
+        Self::try_from(bytes)
+            .map_err(|_| OfferError::ParseInvoiceFailure(DecodeError::InvalidValue))
     }
 }
 
