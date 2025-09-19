@@ -283,11 +283,13 @@ pub async fn create_reply_path_for_offer_creation(
                             continue;
                         }
                         let onion_support = features_support_onion_messages(&node.features);
+                        println!("----------------- onion support for {:?} is {onion_support}", node);
                         let other_channels = node_info
                             .channels
                             .into_iter()
                             .filter(|peer_channel| peer_channel.channel_id != channel.chan_id)
                             .collect::<Vec<tonic_lnd::lnrpc::ChannelEdge>>();
+                        println!("----------------- other channels {:?}", other_channels);
                         if !other_channels.is_empty() && onion_support {
                             let pubkey = PublicKey::from_str(&channel.remote_pubkey).unwrap();
                             intro_channels.push(pubkey);
