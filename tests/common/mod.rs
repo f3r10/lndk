@@ -753,6 +753,7 @@ impl LndNode {
                 Ok(node_info) => {
                     if let Some(node) = node_info.node {
                         if !node.addresses.is_empty() {
+                            log::trace!("Node has address {:?}", node);
                             return;
                         } else {
                             log::trace!("Node {} found but has no addresses yet", node_id);
