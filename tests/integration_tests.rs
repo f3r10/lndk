@@ -1119,6 +1119,7 @@ async fn test_receive_payment_from_offer() {
 
     lnd.wait_for_addresses_to_sync(ldk1_pubkey).await;
 
+
     let offer = handler.create_offer(create_offer_params).await;
     assert!(offer.is_ok());
     let offer = offer.unwrap();
