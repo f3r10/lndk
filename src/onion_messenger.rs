@@ -393,6 +393,7 @@ async fn get_current_peers(
         .map_err(|e| {
             error!("Could not lookup current peers: {e}");
         })?;
+    println!("current peers {:?}", current_peers);
     let peer_support = build_peer_support_from_response(current_peers);
     Ok(peer_support)
 }

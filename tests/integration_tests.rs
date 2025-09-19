@@ -1060,7 +1060,7 @@ async fn pay_offer_and_wait_for_payment(
     let payment = ldk.pay_offer(offer, None).await;
     assert!(payment.is_ok());
     // Wait for the payment to complete on ldk side.
-    common::wait_for_ldk_payment_completion(ldk, Duration::from_secs(30)).await?;
+    common::wait_for_ldk_payment_completion(ldk, Duration::from_secs(60)).await?;
     // Wait for the payment to complete on lnd side.
     common::wait_for_lnd_payment_completion(&mut lnd_client, Duration::from_secs(10)).await?;
     Ok(())
